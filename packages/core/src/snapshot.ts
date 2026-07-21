@@ -102,7 +102,7 @@ const layer = Layer.effect(
           path.join(global.data, "snapshot", location.project.id, Hash.fast(worktree)),
         )
         const snapshotRepository = (yield* fs.existsSafe(path.join(gitDirectory, "HEAD")))
-          ? new Git.Repository({ worktree, gitDirectory, commonDirectory: gitDirectory })
+          ? Git.Repository.snapshot({ worktree, gitDirectory, commonDirectory: gitDirectory })
           : yield* git.repo
               .create({ worktree, gitDirectory, seed: source })
               .pipe(Effect.mapError((cause) => failure("capture", cause)))

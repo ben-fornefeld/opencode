@@ -148,10 +148,21 @@ describe("Git trees", () => {
       const git = yield* Git.Service
       const source = yield* git.repo.discover(AbsolutePath.make(root.path))
       if (!source) throw new Error("Repository not found")
-      const storage = AbsolutePath.make(path.join(root.path, ".snapshot"))
+      const storage = AbsolutePath.make(path.join(root.path, ".snapshot storage"))
       const repository = yield* git.repo.create({ worktree: source.worktree, gitDirectory: storage, seed: source })
+      expect(repository.purpose).toBe("snapshot")
+      expect((yield* git.repo.create({ worktree: source.worktree, gitDirectory: storage, seed: source })).purpose).toBe(
+        "snapshot",
+      )
+      yield* Effect.promise(async () => {
+        await fs.writeFile(path.join(root.path, "scope", "line-endings.txt"), "one\r\n")
+        await $`git --git-dir ${storage} config core.autocrlf true`.quiet()
+      })
       yield* git.index.refresh({ repository, scope: RelativePath.make("scope") })
       const before = yield* git.tree.write(repository)
+      expect(
+        yield* Effect.promise(() => $`git --git-dir ${storage} cat-file blob ${before}:scope/line-endings.txt`.text()),
+      ).toBe("one\r\n")
 
       yield* Effect.promise(async () => {
         await fs.writeFile(path.join(root.path, "scope", "tracked.txt"), "two\n")

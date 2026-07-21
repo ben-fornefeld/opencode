@@ -15,7 +15,23 @@ export class Repository extends Schema.Class<Repository>("Git.Repository")({
   worktree: AbsolutePath,
   gitDirectory: AbsolutePath,
   commonDirectory: AbsolutePath,
-}) {}
+  purpose: Schema.optional(Schema.Literals(["snapshot"])),
+}) {
+  static snapshot(input: { worktree: AbsolutePath; gitDirectory: AbsolutePath; commonDirectory: AbsolutePath }) {
+    return new Repository({ ...input, purpose: "snapshot" })
+  }
+}
+
+const snapshotConfig = [
+  ["core.autocrlf", "false"],
+  ["core.longpaths", "true"],
+  ["core.symlinks", "true"],
+  ["core.fsmonitor", "false"],
+  ["feature.manyFiles", "true"],
+  ["index.version", "4"],
+  ["index.threads", "true"],
+  ["core.untrackedCache", "true"],
+] as const
 
 export const ChangeSet = Schema.String.pipe(Schema.brand("Git.ChangeSet"))
 export type ChangeSet = typeof ChangeSet.Type
@@ -312,6 +328,7 @@ const layer = Layer.effect(
     })
 
     const repositoryArgs = (repository: Repository, args: string[]) => [
+      ...(repository.purpose === "snapshot" ? snapshotConfig.flatMap(([key, value]) => ["-c", `${key}=${value}`]) : []),
       "--git-dir",
       repository.gitDirectory,
       "--work-tree",
@@ -370,26 +387,12 @@ const layer = Layer.effect(
             }),
         ),
       )
-      const repository = new Repository({
+      const repository = Repository.snapshot({
         worktree: input.worktree,
         gitDirectory: input.gitDirectory,
         commonDirectory: input.gitDirectory,
       })
       yield* repositoryOperation("create", repository, ["init"])
-      yield* Effect.forEach(
-        [
-          ["core.autocrlf", "false"],
-          ["core.longpaths", "true"],
-          ["core.symlinks", "true"],
-          ["core.fsmonitor", "false"],
-          ["feature.manyFiles", "true"],
-          ["index.version", "4"],
-          ["index.threads", "true"],
-          ["core.untrackedCache", "true"],
-        ],
-        ([key, value]) => repositoryOperation("create", repository, ["config", key, value]),
-        { discard: true },
-      )
       if (!input.seed) return repository
       yield* fs.ensureDir(path.join(input.gitDirectory, "objects", "info")).pipe(
         Effect.mapError(
