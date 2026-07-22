@@ -31,6 +31,7 @@ import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol
 import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
 import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
 import { inlineCodeKind } from "./markdown-inline-code-kind"
+import { ToolErrorCard } from "./tool-error-card"
 import {
   getRenderedMermaid,
   isMermaidLanguage,
@@ -199,23 +200,31 @@ function createExpandButton(label: string) {
   return host
 }
 
-const actionButtonSelector = '[data-slot="markdown-copy-button"], [data-slot="mermaid-expand-button"]'
+// Every imperatively mounted solid root under a markdown container: code action buttons
+// plus the mermaid error card. All are tracked host-by-host so removing any subtree can
+// dispose them without knowing which kind it holds.
+const mountedHostSelector =
+  '[data-slot="markdown-copy-button"], [data-slot="mermaid-expand-button"], [data-slot="mermaid-error"]'
 
-function disposeCopyButton(host: HTMLElement) {
+const mermaidErrorState = new WeakMap<HTMLElement, () => void>()
+
+function disposeMountedHost(host: HTMLElement) {
   copyButtonState.get(host)?.dispose()
   copyButtonState.delete(host)
   expandButtonState.get(host)?.dispose()
   expandButtonState.delete(host)
+  mermaidErrorState.get(host)?.()
+  mermaidErrorState.delete(host)
 }
 
-function disposeCopyButtons(root: Element) {
+function disposeMountedHosts(root: Element) {
   const hosts = [
-    ...(root instanceof HTMLElement && root.matches(actionButtonSelector) ? [root] : []),
-    ...Array.from(root.querySelectorAll(actionButtonSelector)).filter(
+    ...(root instanceof HTMLElement && root.matches(mountedHostSelector) ? [root] : []),
+    ...Array.from(root.querySelectorAll(mountedHostSelector)).filter(
       (el): el is HTMLElement => el instanceof HTMLElement,
     ),
   ]
-  hosts.forEach(disposeCopyButton)
+  hosts.forEach(disposeMountedHost)
 }
 
 const shellLanguages = new Set(["bash", "sh", "shell", "zsh", "fish", "console", "terminal"])
@@ -273,7 +282,7 @@ function ensureCodeWrapper(block: HTMLPreElement, labels: CopyLabels) {
   }
 
   for (const button of buttons.slice(1)) {
-    disposeCopyButton(button)
+    disposeMountedHost(button)
     button.remove()
   }
 }
@@ -377,7 +386,7 @@ function setupCodeActions(root: HTMLDivElement, getLabels: () => CopyLabels, exp
     for (const timeout of timeouts.values()) {
       clearTimeout(timeout)
     }
-    disposeCopyButtons(root)
+    disposeMountedHosts(root)
   }
 }
 
@@ -524,7 +533,7 @@ export function Markdown(
     if (!container) return
     if (isServer) return
     if (content.length === 0) {
-      disposeCopyButtons(container)
+      disposeMountedHosts(container)
       container.innerHTML = ""
       return
     }
@@ -545,7 +554,7 @@ export function Markdown(
     while (container.children.length > content.length) {
       const child = container.lastElementChild
       if (!child) break
-      disposeCopyButtons(child)
+      disposeMountedHosts(child)
       child.remove()
     }
     container
@@ -672,7 +681,7 @@ function updateBlock(container: HTMLDivElement, index: number, block: RenderedBl
       return true
     },
     onBeforeNodeDiscarded: (node) => {
-      if (node instanceof Element) disposeCopyButtons(node)
+      if (node instanceof Element) disposeMountedHosts(node)
       return true
     },
   })
@@ -744,7 +753,7 @@ function updateCodeBlock(
     raw: block.raw,
   })
   if (current) {
-    disposeCopyButtons(current)
+    disposeMountedHosts(current)
     current.replaceWith(next)
     return
   }
@@ -785,7 +794,7 @@ function updateMermaidBlock(
 
   if (existing) return
   if (current) {
-    disposeCopyButtons(current)
+    disposeMountedHosts(current)
     current.replaceWith(next)
     return
   }
@@ -796,7 +805,7 @@ function ensureMermaidWrapper(next: HTMLElement, labels: CopyLabels) {
   const found = next.querySelector<HTMLElement>('[data-component="markdown-code"][data-code-kind="mermaid"]')
   if (found) return found
 
-  disposeCopyButtons(next)
+  disposeMountedHosts(next)
   next.textContent = ""
   const wrapper = document.createElement("div")
   wrapper.setAttribute("data-component", "markdown-code")
@@ -815,10 +824,6 @@ function ensureMermaidWrapper(next: HTMLElement, labels: CopyLabels) {
   const diagram = document.createElement("div")
   diagram.setAttribute("data-slot", "mermaid-diagram")
 
-  const error = document.createElement("div")
-  error.setAttribute("data-slot", "mermaid-error")
-
-  wrapper.appendChild(error)
   wrapper.appendChild(pre)
   wrapper.appendChild(diagram)
   wrapper.appendChild(createExpandButton(labels.expand ?? ""))
@@ -854,7 +859,7 @@ function renderMermaidBlock(wrapper: HTMLElement, source: string, complete: bool
     if (mermaidBlocks.get(wrapper)?.request !== request || !wrapper.isConnected) return
     if (!result.ok) {
       wrapper.dataset.mermaidState = "source"
-      setMermaidError(wrapper, `${labels.mermaidError ?? "Diagram failed to render"}: ${result.error.split("\n")[0]}`)
+      setMermaidError(wrapper, result.error, labels)
       return
     }
     showMermaid(wrapper, result.svg)
@@ -869,15 +874,34 @@ function showMermaid(wrapper: HTMLElement, svg: string) {
   wrapper.dataset.mermaidState = "rendered"
 }
 
-function setMermaidError(wrapper: HTMLElement, message: string | undefined) {
-  const error = wrapper.querySelector<HTMLElement>('[data-slot="mermaid-error"]')
-  if (!message) {
+// The error card mounts as a sibling below the code block, reusing the same collapsible
+// error UI as failed tool calls. The wrapper keeps only the data flag for settledness.
+function setMermaidError(wrapper: HTMLElement, error: string | undefined, labels?: CopyLabels) {
+  const existing = wrapper.parentElement?.querySelector<HTMLElement>(':scope > [data-slot="mermaid-error"]')
+  if (existing) disposeMountedHost(existing)
+  existing?.remove()
+
+  if (!error) {
     delete wrapper.dataset.mermaidError
-    if (error) error.textContent = ""
     return
   }
   wrapper.dataset.mermaidError = "true"
-  if (error) error.textContent = message
+
+  const host = document.createElement("div")
+  host.setAttribute("data-slot", "mermaid-error")
+  const dispose = render(
+    () => (
+      <ToolErrorCard
+        tool="mermaid"
+        title="Mermaid"
+        subtitle={labels?.mermaidError ?? "Diagram failed to render"}
+        error={error}
+      />
+    ),
+    host,
+  )
+  mermaidErrorState.set(host, dispose)
+  wrapper.after(host)
 }
 
 function sameToken(left: MarkdownToken, right: MarkdownToken | undefined) {

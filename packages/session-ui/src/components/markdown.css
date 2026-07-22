@@ -228,19 +228,10 @@
     cursor: zoom-in;
   }
 
-  [data-component="markdown-code"][data-code-kind="mermaid"] [data-slot="mermaid-error"] {
-    display: none;
-  }
-
-  [data-component="markdown-code"][data-code-kind="mermaid"][data-mermaid-error="true"] [data-slot="mermaid-error"] {
+  [data-slot="mermaid-error"] {
     display: block;
-    margin-top: 12px;
-    padding: 6px 8px;
-    border: 0.5px solid var(--v2-border-border-muted);
-    border-radius: 4px;
-    background: var(--v2-background-bg-layer-02);
-    font-size: 12px;
-    color: var(--v2-text-text-muted);
+    margin-top: -12px;
+    margin-bottom: 24px;
   }
 
   [data-slot="mermaid-expand-button"] {

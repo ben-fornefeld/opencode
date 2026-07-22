@@ -81,4 +81,11 @@ export const mermaidShapes = [
   "  J --> L(((Done)))",
   "  K --> L",
   "```",
+  "",
+  "A broken diagram shows the shared error card below the source:",
+  "",
+  "```mermaid",
+  "graph TD",
+  "  A -->",
+  "```",
 ].join("\n")
