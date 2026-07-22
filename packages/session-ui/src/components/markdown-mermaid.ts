@@ -88,13 +88,51 @@ let sequence = 0
 // measuring text, so renders must run one at a time to avoid clobbering each other.
 let queue: Promise<unknown> = Promise.resolve()
 
+const cacheLimit = 30
+const renderedCache = new Map<string, string>()
+
+function renderedCacheKey(source: string, scheme: MermaidColorScheme) {
+  return `${scheme}\u0000${source}`
+}
+
+// Synchronous cache hits let remounted messages swap the diagram in without flashing
+// the source while a redundant render runs.
+export function getRenderedMermaid(source: string, scheme: MermaidColorScheme) {
+  const key = renderedCacheKey(source, scheme)
+  const hit = renderedCache.get(key)
+  if (hit === undefined) return
+  renderedCache.delete(key)
+  renderedCache.set(key, hit)
+  return hit
+}
+
+export function storeRenderedMermaid(source: string, scheme: MermaidColorScheme, svg: string) {
+  const key = renderedCacheKey(source, scheme)
+  renderedCache.delete(key)
+  renderedCache.set(key, svg)
+  if (renderedCache.size <= cacheLimit) return
+  const first = renderedCache.keys().next().value
+  if (first) renderedCache.delete(first)
+}
+
 async function load(scheme: MermaidColorScheme) {
-  loader ??= import("mermaid").then((module) => module.default)
+  if (!loader) {
+    const pending = import("mermaid").then((module) => module.default)
+    // A failed chunk load must retry on the next render instead of poisoning every
+    // future diagram with the cached rejection.
+    pending.catch(() => {
+      if (loader === pending) loader = undefined
+    })
+    loader = pending
+  }
   const mermaid = await loader
   if (initializedScheme !== scheme) {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
+      // Generated charts legitimately exceed mermaid's conservative defaults.
+      maxTextSize: 90_000,
+      maxEdges: 2_000,
       theme: "base",
       themeVariables: { ...mermaidThemeVariables(scheme), fontFamily: appFontFamily(), fontSize: "14px" },
       themeCSS: mermaidThemeCss(scheme),
@@ -105,11 +143,17 @@ async function load(scheme: MermaidColorScheme) {
 }
 
 export function renderMermaid(source: string, scheme: MermaidColorScheme): Promise<MermaidRenderResult> {
+  const cached = getRenderedMermaid(source, scheme)
+  if (cached !== undefined) return Promise.resolve({ ok: true, svg: cached })
   // The runner converts every failure into a result, so the queue never rejects.
   const result = queue.then(async (): Promise<MermaidRenderResult> => {
+    // An earlier queued render of the same source may have completed while waiting.
+    const hit = getRenderedMermaid(source, scheme)
+    if (hit !== undefined) return { ok: true, svg: hit }
     try {
       const mermaid = await load(scheme)
       const { svg } = await mermaid.render(`mermaid-diagram-${++sequence}`, source)
+      storeRenderedMermaid(source, scheme, svg)
       return { ok: true, svg }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }

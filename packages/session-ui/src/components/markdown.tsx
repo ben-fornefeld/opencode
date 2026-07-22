@@ -31,7 +31,13 @@ import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol
 import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
 import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
 import { inlineCodeKind } from "./markdown-inline-code-kind"
-import { isMermaidLanguage, mermaidColorScheme, renderMermaid, type MermaidColorScheme } from "./markdown-mermaid"
+import {
+  getRenderedMermaid,
+  isMermaidLanguage,
+  mermaidColorScheme,
+  renderMermaid,
+  type MermaidColorScheme,
+} from "./markdown-mermaid"
 import { openMermaidViewer } from "./markdown-mermaid-viewer"
 
 type RenderedBlock =
@@ -89,6 +95,7 @@ type CopyLabels = {
   copy: string
   copied: string
   expand?: string
+  mermaidError?: string
 }
 
 type CopyButtonState = {
@@ -374,31 +381,32 @@ function setupCodeActions(root: HTMLDivElement, getLabels: () => CopyLabels, exp
   }
 }
 
+// The first paint synthesizes every block instead of collapsing to one escaped blob:
+// cached prose renders instantly, uncached prose falls back per block, and code blocks
+// mount in their final structure so mermaid diagrams can swap in without flicker.
 function initialResult(text: string, key: string | undefined, projection: Projection, owner: string): RenderResult {
   if (!text) return { text, blocks: [] }
   const base = key ?? checksum(text)
-  if (base) {
-    const blocks = projection.blocks.flatMap((block, index) => {
-      if (block.mode === "code") return []
-      const cacheKey = `${base}:${index}:${block.mode}`
-      const cached = getCachedMarkdown(cacheKey)
-      if (cached?.raw !== block.raw) return []
-      return [{ key: `${owner}:${cacheKey}`, mode: block.mode, ...cached }]
-    })
-    if (blocks.length === projection.blocks.length) return { text, blocks }
-  }
-  return {
-    text,
-    blocks: [
-      {
-        key: "initial",
-        mode: "full",
-        raw: text,
-        hash: checksum(text) ?? "",
-        html: fallback(text),
-      },
-    ],
-  }
+  const blocks = projection.blocks.map((block, index): RenderedBlock => {
+    const blockKey = markdownBlockKey(owner, key, index, block.mode)
+    if (block.mode === "code")
+      return {
+        key: blockKey,
+        mode: block.mode,
+        raw: block.raw,
+        src: block.src,
+        hash: String(block.raw.length),
+        language: block.language ?? "text",
+        complete: !!block.complete,
+        stable: [],
+        generation: 0,
+        unstable: [[block.src, ""] as MarkdownToken],
+      }
+    const cached = base ? getCachedMarkdown(`${base}:${index}:${block.mode}`) : undefined
+    if (cached && cached.raw === block.raw) return { key: blockKey, mode: block.mode, ...cached }
+    return { key: blockKey, mode: block.mode, raw: block.raw, hash: checksum(block.raw) ?? "", html: fallback(block.src) }
+  })
+  return { text, blocks }
 }
 
 export function Markdown(
@@ -525,6 +533,7 @@ export function Markdown(
       copy: i18n.t("ui.message.copy"),
       copied: i18n.t("ui.message.copied"),
       expand: i18n.t("ui.mermaid.expand"),
+      mermaidError: i18n.t("ui.mermaid.renderError"),
     }
     const nextCodeKeys = new Set(content.filter((block) => block.mode === "code").map((block) => block.key))
     activeCodeKeys.forEach((key) => {
@@ -742,8 +751,11 @@ function updateCodeBlock(
   container.appendChild(next)
 }
 
-// Records the source and color scheme of the last render started per block, so identical
-// effect re-runs (including after a deterministic parse failure) do not re-render.
+// Records the source and color scheme of the last render started, keyed by the mermaid
+// wrapper so the state dies with the DOM it describes: a wrapper rebuilt after being
+// clobbered (for example by morphdom when streaming shifts block indexes) re-renders
+// instead of trusting stale bookkeeping. Settledness is verified against the wrapper's
+// own dataset, never the map alone.
 type MermaidRenderState = {
   source: string
   scheme: MermaidColorScheme
@@ -769,7 +781,7 @@ function updateMermaidBlock(
   const wrapper = ensureMermaidWrapper(next, labels)
   const source = wrapper.querySelector<HTMLElement>('[data-slot="mermaid-source"] > code')
   if (source && source.textContent !== block.src) source.textContent = block.src
-  renderMermaidBlock(next, wrapper, block.src, block.complete)
+  renderMermaidBlock(wrapper, block.src, block.complete, labels)
 
   if (existing) return
   if (current) {
@@ -803,6 +815,10 @@ function ensureMermaidWrapper(next: HTMLElement, labels: CopyLabels) {
   const diagram = document.createElement("div")
   diagram.setAttribute("data-slot", "mermaid-diagram")
 
+  const error = document.createElement("div")
+  error.setAttribute("data-slot", "mermaid-error")
+
+  wrapper.appendChild(error)
   wrapper.appendChild(pre)
   wrapper.appendChild(diagram)
   wrapper.appendChild(createExpandButton(labels.expand ?? ""))
@@ -811,33 +827,57 @@ function ensureMermaidWrapper(next: HTMLElement, labels: CopyLabels) {
   return wrapper
 }
 
-function renderMermaidBlock(next: HTMLElement, wrapper: HTMLElement, source: string, complete: boolean) {
+function renderMermaidBlock(wrapper: HTMLElement, source: string, complete: boolean, labels: CopyLabels) {
   if (!complete) {
     wrapper.dataset.mermaidState = "source"
-    delete wrapper.dataset.mermaidError
+    setMermaidError(wrapper, undefined)
     return
   }
 
   const scheme = mermaidColorScheme()
-  const previous = mermaidBlocks.get(next)
-  if (previous && previous.source === source && previous.scheme === scheme) return
+  const previous = mermaidBlocks.get(wrapper)
+  const attempted = !!previous && previous.source === source && previous.scheme === scheme
+  if (attempted && (wrapper.dataset.mermaidState === "rendered" || wrapper.dataset.mermaidError === "true")) return
 
   const request = (previous?.request ?? 0) + 1
-  mermaidBlocks.set(next, { source, scheme, request })
-  if (wrapper.dataset.mermaidState !== "rendered") wrapper.dataset.mermaidState = "source"
+  mermaidBlocks.set(wrapper, { source, scheme, request })
 
+  // Known diagrams swap in synchronously so remounts never flash the source.
+  const cached = getRenderedMermaid(source, scheme)
+  if (cached !== undefined) {
+    showMermaid(wrapper, cached)
+    return
+  }
+
+  if (wrapper.dataset.mermaidState !== "rendered") wrapper.dataset.mermaidState = "source"
   void renderMermaid(source, scheme).then((result) => {
-    if (mermaidBlocks.get(next)?.request !== request || !next.isConnected) return
+    if (mermaidBlocks.get(wrapper)?.request !== request || !wrapper.isConnected) return
     if (!result.ok) {
       wrapper.dataset.mermaidState = "source"
-      wrapper.dataset.mermaidError = "true"
+      setMermaidError(wrapper, `${labels.mermaidError ?? "Diagram failed to render"}: ${result.error.split("\n")[0]}`)
       return
     }
-    const diagram = wrapper.querySelector<HTMLElement>('[data-slot="mermaid-diagram"]')
-    if (diagram) diagram.innerHTML = result.svg
-    delete wrapper.dataset.mermaidError
-    wrapper.dataset.mermaidState = "rendered"
+    showMermaid(wrapper, result.svg)
   })
+}
+
+function showMermaid(wrapper: HTMLElement, svg: string) {
+  const diagram = wrapper.querySelector<HTMLElement>('[data-slot="mermaid-diagram"]')
+  if (!diagram) return
+  diagram.innerHTML = svg
+  setMermaidError(wrapper, undefined)
+  wrapper.dataset.mermaidState = "rendered"
+}
+
+function setMermaidError(wrapper: HTMLElement, message: string | undefined) {
+  const error = wrapper.querySelector<HTMLElement>('[data-slot="mermaid-error"]')
+  if (!message) {
+    delete wrapper.dataset.mermaidError
+    if (error) error.textContent = ""
+    return
+  }
+  wrapper.dataset.mermaidError = "true"
+  if (error) error.textContent = message
 }
 
 function sameToken(left: MarkdownToken, right: MarkdownToken | undefined) {

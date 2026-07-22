@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test"
 import {
   clampMermaidZoom,
   fitMermaidCamera,
+  getRenderedMermaid,
   isMermaidLanguage,
   stepMermaidZoom,
+  storeRenderedMermaid,
   zoomMermaidCamera,
 } from "./markdown-mermaid"
 import { mermaidThemeCss, mermaidThemeVariables } from "./markdown-mermaid-theme"
@@ -50,6 +52,22 @@ describe("mermaidThemeVariables", () => {
       expect(scale.every((color) => typeof color === "string")).toBe(true)
       expect(theme.git0).toBe(theme.cScale0)
     }
+  })
+})
+
+describe("mermaid render cache", () => {
+  test("keys by source and scheme and evicts the least recently used entry", () => {
+    storeRenderedMermaid("graph TD;A-->B", "dark", "<svg>dark</svg>")
+    storeRenderedMermaid("graph TD;A-->B", "light", "<svg>light</svg>")
+    expect(getRenderedMermaid("graph TD;A-->B", "dark")).toBe("<svg>dark</svg>")
+    expect(getRenderedMermaid("graph TD;A-->B", "light")).toBe("<svg>light</svg>")
+    expect(getRenderedMermaid("graph TD;A-->C", "dark")).toBeUndefined()
+
+    // Touching the oldest entry protects it from eviction when the cache overflows.
+    getRenderedMermaid("graph TD;A-->B", "dark")
+    for (let index = 0; index < 29; index++) storeRenderedMermaid(`graph TD;N${index}`, "dark", "<svg/>")
+    expect(getRenderedMermaid("graph TD;A-->B", "dark")).toBe("<svg>dark</svg>")
+    expect(getRenderedMermaid("graph TD;A-->B", "light")).toBeUndefined()
   })
 })
 

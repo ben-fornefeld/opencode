@@ -186,6 +186,7 @@ export const dict: Record<string, string> = {
   "ui.mermaid.zoomIn": "Zoom in",
   "ui.mermaid.zoomOut": "Zoom out",
   "ui.mermaid.zoomReset": "Reset zoom",
+  "ui.mermaid.renderError": "Diagram failed to render",
 
   "ui.patch.action.deleted": "Deleted",
   "ui.patch.action.created": "Created",
